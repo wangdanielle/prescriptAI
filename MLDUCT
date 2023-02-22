@@ -1,0 +1,253 @@
+library(plyr)
+#library(torch)
+#library(tabnet)
+library(tidyverse)
+library(tidymodels)
+library(finetune) #to use tuning functions from the new finetune package
+library(vip) #to plot feature importances
+library(butcher)  ## devtools::install_github("tidymodels/butcher") # install development version 
+library(lobstr) # to inspect object size 
+library(bundle) 
+#library(tableone)
+#library(Boruta)
+library(ranger)
+library(xgboost)
+library(lubridate)
+library(glue)
+#library(lightgbm)
+#library(bonsai) 
+library(data.table)
+library(glmnet)
+#library(gbm)
+library(PresenceAbsence)
+#library(mlbench)
+#library(missRanger)
+#require(tableone)
+
+library(parallel)
+library(doParallel)
+cores <-   6
+registerDoParallel(cores=cores)
+
+library(devtools)
+library(roxygen2)
+
+
+Rcode2 <- "____"
+load_all(path =Rcode2)
+document(pkg = Rcode2) 
+
+path = "____"
+
+dat <- readRDS(file = paste0(path, "____"))
+
+
+
+#nas <- sapply(dat, function(x) sum(is.na(x)))
+
+
+## convert the jaccard index to binary. Simply set all jaccard == 0 to 0 and others to 1 
+
+dat <- dat %>% mutate(ADR_outcome = ifelse(ADR_jaccard > 0 & !is.na(ADR_jaccard), "Yes", "No"), 
+                      sADR_outcome = ifelse(sADR_jaccard > 0 & !is.na(sADR_jaccard), "Yes", "No"), 
+                      Gene_outcome =  ifelse(Gene_jaccard > 0 & !is.na(Gene_jaccard), "Yes", "No")
+)
+
+apply(dat[, c("Gene_outcome", "sADR_outcome", "ADR_outcome")], 2, table)/nrow(dat)*100
+
+
+
+predictors <- c("no.drugA.ADR", "no.drugB.ADR", "no.drugA.sADR", "no.drugB.sADR", 
+                "no.durgA.genes", "no.drugB.genes", names(dat)[grepl("ADR_", names(dat))], 
+                names(dat)[grepl("Gene_", names(dat))]) 
+predictors <- setdiff(predictors, c("ADR_outcome", "sADR_outcome", "Gene_outcome", "sADR_jaccard", "ADR_jaccard", "Gene_jaccard")) 
+
+
+
+Flt <- Filter.Vars(dat = dat, rhs.vars = predictors, thresh=0.005)  ## drop rare features, with threshold less than .5% 
+data <- Flt$data 
+
+
+# #DDII = druh-drug interaction internsity model: 
+## predictors are  ADR_* columns while outcome is the Gene_Jaccard, converted to binary 
+## also include the number of ADR for each drug in the interactions
+## The outcome for the DDII model is the Gene_jaccard 
+
+ADR_predictors <- intersect(c("no.drugA.ADR", "no.drugB.ADR", "no.drugA.sADR", "no.drugB.sADR", 
+                              predictors[grepl("ADR_", predictors)]), names(data))
+
+
+##SDDI = serious DDI model 
+## predictors of this model are the Gene_* columns 
+## also include number of genes for each drug in the interaction
+## The outcome of the SDDI model is the sADR_jaccard - we'll also predict ADR_jaccard 
+
+Gene_predictors <- intersect(c("no.durgA.genes", "no.drugB.genes", predictors[grepl("Gene_", predictors)]), 
+                             names(data))
+
+
+
+
+method = c("glmnet", "xgboost")
+
+
+
+
+### imputed analysis 
+trControl = list(
+  number = 5,   ## number of cross-validation 
+  burn_in = 3, 
+  mode = "classification",               
+  ## TabNet parameters  
+  epochs = 10, 
+  batch_size = 2000, 
+  penalty = 0.001, 
+  virtual_batch_size = 500,              
+  ## xgboost and lightgbm  paramters               
+  xgb.trees = 1000, 
+  lambda = 0, 
+  alpha = 1, 
+  lambda_11 = 0,
+  lambda_12 = 0, 
+  min_gain_to_split = 0, 
+  sample.prop = c(0.4, 0.9),
+  xgb.mtry = NULL, 
+  xgb.min_n = NULL, 
+  tree_method  = c("hist", "approx", "gpu_hist")[2],  
+  ## ranger parameters              
+  rf.mtry = NULL, 
+  rf.min_n = NULL, 
+  importance = "impurity", 
+  ## glmnet parameters 
+  penalty = NULL, 
+  mixture = NULL                          
+) 	     
+
+
+
+## take a random sample of the data 
+
+ix <- sample(nrow(data), 50000)
+dd <- data[ix, ]
+
+#trn.ix <- sample(nrow(dd), floor(nrow(dd)*0.70))
+#tst.ix <- setdiff(1:nrow(dd), trn.ix) 
+#x <- list(analysis = trn.ix, assessment = tst.ix)
+#split <- rsample::make_splits(x, dd, class = c("initial_split","rsplit"))  ## create custom training and test sets 
+
+
+
+## SDDI model 
+split <- initial_split(data = dd, strata = sADR_outcome)  ## can also use initial spilt to create random training and test sets 
+form <- as.formula(paste0(paste0("sADR_outcome", "~ "), paste0(Gene_predictors, collapse = "+"))) 
+
+rec <- recipe(formula = form, data = training(split) ) %>%
+  #                       step_impute_bag(all_predictors(), trees = 50) %>%                         
+  #                       step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  step_zv(all_predictors()) %>% 
+  step_nzv(all_predictors(), unique_cut = 5) 
+#                       %>% step_normalize(all_numeric_predictors())       
+
+model.glmnet <- trainMLpipeline(rec, 
+                                data.split = split, 
+                                method = method[1],  
+                                trControl = trControl, 
+                                grid.size = 6, ### increase grid size for xgboost 
+                                tune = TRUE, 
+                                cores = cores,
+                                opt.method = 9, 
+                                positive.class = "Yes",  ## lable of the positive class 
+                                metric = "roc_auc", 
+                                verbose = TRUE, 
+                                allow_par = FALSE  ## xgboost hangs when set to parallel mode               
+)
+
+
+
+perf <- rbind(model.glmnet$perf.dev, model.glmnet$perf.val)
+print(perf)
+
+saveRDS(model.glmnet, file=paste0(path, "____"))
+write.csv(perf, file =paste0(path, "____"), row.names = FALSE)
+
+## SDDI-2 model 
+split <- initial_split(data = dd, strata = ADR_outcome)  ## can also use initial spilt to create random training and test sets 
+form <- as.formula(paste0(paste0("ADR_outcome", "~ "), paste0(Gene_predictors, collapse = "+"))) 
+
+rec <- recipe(formula = form, data = training(split) ) %>%
+  #                       step_impute_bag(all_predictors(), trees = 50) %>%                         
+  #                       step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+  step_zv(all_predictors()) %>% 
+  step_nzv(all_predictors(), unique_cut = 5) 
+#                       %>% step_normalize(all_numeric_predictors())       
+
+model.glmnet2 <- trainMLpipeline(rec, 
+                                 data.split = split, 
+                                 method = method[1],  
+                                 trControl = trControl, 
+                                 grid.size = 6, ### increase grid size for xgboost
+                                 tune = TRUE, 
+                                 cores = cores,
+                                 opt.method = 9, 
+                                 positive.class = "Yes",  ## lable of the positive class 
+                                 metric = "roc_auc", 
+                                 verbose = TRUE, 
+                                 allow_par = FALSE  ## xgboost hangs when set to parallel mode               
+)
+
+
+
+perf2 <- rbind(model.glmnet2$perf.dev, model.glmnet2$perf.val)
+print(perf2)
+
+
+saveRDS(model.glmnet2, file=paste0(path, "____"))
+write.csv(perf2, file =paste0(path, "____"), row.names = FALSE)
+
+
+
+
+
+## DDII model 
+split <- initial_split(data = dd, strata = Gene_outcome)  ## can also use initial split to create random training and test sets 
+## use recipe without formula:  This is the recommended approach when the number of variables is very high, 
+# as the formula method is memory-inefficient with many variables.
+## form <- as.formula(paste0(paste0("Gene_outcome", "~ "), paste0(ADR_predictors, collapse = "+"))) 
+
+rec <- recipe(x = training(split) ) %>%
+  update_role(Gene_outcome, new_role = "outcome") %>%
+  update_role(all_of(ADR_predictors), new_role = "predictor") %>%
+  step_zv(all_predictors()) %>% 
+  step_nzv(all_predictors(), unique_cut = 5) 
+
+
+
+model.glmnet3 <- trainMLpipeline(rec, 
+                                 data.split = split, 
+                                 method = method[1],  
+                                 trControl = trControl, 
+                                 grid.size = 6, ### increase grid size for xgboost
+                                 tune = TRUE, 
+                                 cores = cores,
+                                 opt.method = 9, 
+                                 positive.class = "Yes",  ## lable of the positive class 
+                                 metric = "roc_auc", 
+                                 verbose = TRUE, 
+                                 allow_par = FALSE  ## xgboost hangs when set to parallel mode               
+)
+
+
+
+perf3 <- rbind(model.glmnet3$perf.dev, model.glmnet3$perf.val)
+print(perf3)
+
+saveRDS(model.glmnet3, file=paste0(path, "____"))
+write.csv(perf3, file =paste0(path, "____"), row.names = FALSE)
+
+
+
+
+
+
+
+
