@@ -1,0 +1,229 @@
+# devtools::install_github("ropensci/dbparser")
+# devtools::install_github("interstellar-Consultation-Services/dbdataset")
+
+#library(dbparser)
+#library(dbdataset)
+#library(devtools)
+#library(roxygen2)
+
+library(tidyverse)
+library(ggplot2)
+library(jaccard)
+## load packages for parallel computing 
+#library(foreach)
+#library(doParallel)
+#cl <- makeCluster(8) ## set to the number of cores on your computer 
+#registerDoParallel(cl)
+
+
+
+path = "___"
+
+if (!require("dbdataset", quietly = TRUE)){
+pkg <- paste0(path, "/Code/dbdataset")
+load_all(pkg)
+document(pkg)
+}
+
+## load sider data : check the readme file in the sider folder 
+sd_atc <- read_tsv(file = paste0(path, "/Data/SIDER/drug_atc.tsv"), col_names = c("DrugID", "atc_code"))
+sd_names <- read_tsv(file = paste0(path, "/Data/SIDER/drug_names.tsv"), col_names = c("DrugID", "sider_drug_name"))
+sd_se <- read_tsv(file = paste0(path, "/Data/SIDER/meddra_all_se.tsv"), col_names = 
+                    c("DrugID", "DrugID2", "umls_id", "MedDRA_concept_type", "umls_id_meddra.se", "ADR"))
+sd_ind <- read_tsv(file = paste0(path, "/Data/SIDER/meddra_all_indications.tsv"), col_names = 
+                    c("DrugID", "umls_id", "method", "Indication", "MedDRA_concept_type", "umls_id_meddra.ind", "MedDRA_concept_name"))
+
+## this file contains meddra codes that can be used to identify serious ADR 
+sd_mdra <-  read_tsv(file = paste0(path, "/Data/SIDER/meddra.tsv"), col_names = 
+                       c("umls_id", "MedDRA_concept_type", "MedDRA_code",  "ADR_meddra"), quote = "" )
+
+mdra <- read_csv(file = paste0(path, "/Data/MedDRA/MedDRA_SADR.csv"))
+
+
+
+## combine sider data 
+sd <- sd_atc %>% left_join(sd_names, by = "DrugID") %>% 
+                     left_join(sd_se, by = "DrugID") %>%  
+                     left_join(sd_ind, by = c("DrugID", "umls_id"))
+ #                    
+ 
+sd_dat <- sd %>% select(atc_code, sider_drug_name, umls_id, ADR,Indication) %>% 
+                       filter(!is.na(Indication)) %>% 
+                       distinct() 
+
+
+sd_dat <- sd_dat %>% left_join(select(sd_mdra, umls_id, MedDRA_code, ADR_meddra),  by = "umls_id")
+
+
+### serious ADR 
+sd_dat <- sd_dat %>% mutate(sADR =  ifelse(MedDRA_code %in% unique(mdra$MedDRA_Code), "Yes", "No")) 
+
+print(sd_dat, n = 50)
+
+
+
+### merge drugbank Drugs table with ATC_Codes_Drug so we can combine with sider data using atc code 
+d <- Drugs %>% select(primary_key, name) %>% rename(drugs = primary_key, drugbank_name = name) %>% 
+               mutate(drugs = str_trim(drugs))
+atc <- ATC_Codes_Drug %>% select(atc_code, `drugbank-id`) %>% rename(drugs = `drugbank-id`) %>% 
+                          mutate(drugs = str_trim(drugs))
+
+d <- d %>% left_join(atc, by = "drugs") %>% distinct()
+
+### merge with sider drugs by atc codes and filter out missing cases 
+dd <- d %>% inner_join(sd_dat, by =  "atc_code") %>% filter(!is.na(Indication) | !is.na(ADR_meddra))  %>% distinct()
+
+
+## merge with drug targets 
+
+Tdat <- Targets_Drug %>% filter(organism == "Humans") %>% select(name, parent_key) %>%  
+                         rename(genes = name, drugs = parent_key) %>% mutate(drugs = str_trim(drugs)) %>% 
+                         distinct() 
+
+DT <- Tdat %>% left_join(dd, by = "drugs")  %>% filter(!is.na(Indication) | !is.na(ADR)) %>% distinct() ## drug - genes- ADR - disease data 
+D <- unique(DT$drugs)  ## set all drugs 
+G <- unique(DT$genes)  ## set of all genes 
+I <- unique(DT$Indication) # set of all indications 
+ADR <- unique(DT$ADR_meddra)
+sADR <- unique(DT$ADR_meddra[DT$sADR == "Yes"])
+
+
+
+DDI <- Interactions_Drug %>% select(`drugbank-id`, parent_key) %>% 
+                            rename(drugA = `drugbank-id`, drugB = parent_key) %>% 
+                            mutate(drugA = str_trim(drugA), drugB = str_trim(drugB)) %>% 
+                            filter(drugA %in% D & drugB %in% D) %>% distinct() ## drug interactions for selected drugs  
+### 
+
+#DT <- DT %>% filter(drugs %in% DDI$drugA,  drugs %in% DDI$drugB)
+
+
+
+
+dat <- do.call(rbind, lapply(1:nrow(DDI), function(ii) {
+            drugA = DDI$drugA[ii]
+            drugB = DDI$drugB[ii]
+            ## create gene vector (predictors)  for  SDDI model   
+            VA = 1*G %in% unique(DT$genes[DT$drugs == drugA]) 
+            VB = 1*G %in% unique(DT$genes[DT$drugs == drugB])
+            g = data.frame(t(VA + VB)) ## gene vector 
+            names(g) <- paste0("Gene_", 1:length(G))
+            gA = sum(VA); gB = sum(VB) # number of targeted genes 
+            
+            ## create outcome for DDII model based on the jackard index of gene vector 
+            Gene_jaccard <- jaccard::jaccard(VA, VB)
+            
+            ## create ADR vector (predictors)  for  DDII model 
+            VA = 1*ADR %in% unique(DT$ADR_meddra[DT$drugs == drugA]) 
+            VB = 1*ADR %in% unique(DT$ADR_meddra[DT$drugs == drugB]) 
+            e = data.frame(t(VA + VB)) ## ADR vector 
+            names(e) <- paste0("ADR_", 1:length(ADR))
+            eA = sum(VA); eB = sum(VB) # number of side-effects 
+            ## create outcome for SDDI model based on the jaccard index of ADR vector 
+            ADR_jaccard <- jaccard::jaccard(VA, VB)
+            
+            ## serious ADR for either drugs   
+            sadr = 1*("Yes" %in% unique(c(DT$sADR[DT$drugs == drugA], DT$sADR[DT$drugs == drugB])))
+            
+            ## use jaccard index to create a categorization of serious ADR 
+            VA = 1*sADR %in% unique(DT$ADR_meddra[DT$drugs == drugA]) 
+            VB = 1*sADR %in% unique(DT$ADR_meddra[DT$drugs == drugB])
+            seA = sum(VA); seB = sum(VB) # number of serious side-effects 
+            sADR_jaccard <- jaccard::jaccard(VA, VB)
+            
+            cbind.data.frame(DDI = paste0(c(drugA, "_", drugB), collapse = ""), 
+                             no.durgA.genes = gA, no.drugB.genes = gB, 
+                             no.drugA.ADR = eA, no.drugB.ADR = eB, 
+                             no.drugA.sADR = seA, no.drugB.sADR =seB, 
+                             sADR_jaccard = sADR_jaccard, 
+                             Gene_jaccard= Gene_jaccard, 
+                             ADR_jaccard = ADR_jaccard, 
+                             sADR = sadr, g, e)
+    }
+  ))
+
+saveRDS(dat, file = paste0(path, "____"))
+#
+#dat <- readRDS(file = paste0(path, "____"))
+
+
+
+
+
+
+
+
+sp1 <- ggplot2::ggplot(data= dat[1:40000, ], aes(x=ADR_jaccard, y=DDI)) + geom_point()
+sp1 
+
+
+
+sp2 <- ggplot2::ggplot(data= dat, aes(x=Gene_jaccard, y=DDI)) + geom_point()
+sp2 
+
+
+sp3 <- ggplot2::ggplot(data= dat, aes(x=sADR_jaccard, y=DDI)) + geom_point()
+sp3 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+dat <- foreach(i=1:30, .combine = rbind) %dopar% {
+            drugA = DDI$drugA[ii]
+            drugB = DDI$drugB[ii]
+            ## create gene vector (predictors)  for  SDDI model   
+            VA = 1*G %in% unique(DT$genes[DT$drugs == drugA]) 
+            VB = 1*G %in% unique(DT$genes[DT$drugs == drugB])
+            g = data.frame(t(VA + VB)) ## gene vector 
+            names(g) <- paste0("Gene_", 1:length(G))
+            gA = sum(VA); gB = sum(VB) # number of targeted genes 
+            
+            ## create outcome for DDII model based on the jackard index of gene vector 
+            Gene_jaccard <- jaccard::jaccard(VA, VB)
+            
+            ## create ADR vector (predictors)  for  DDII model 
+            VA = 1*ADR %in% unique(DT$ADR_meddra[DT$drugs == drugA]) 
+            VB = 1*ADR %in% unique(DT$ADR_meddra[DT$drugs == drugB]) 
+            e = data.frame(t(VA + VB)) ## ADR vector 
+            names(e) <- paste0("ADR_", 1:length(ADR))
+            eA = sum(VA); eB = sum(VB) # number of side-effects 
+            ## create outcome for SDDI model based on the jaccard index of ADR vector 
+            ADR_jaccard <- jaccard::jaccard(VA, VB)
+            
+            ## serious ADR for either drugs   
+            sadr = 1*("Yes" %in% unique(c(DT$sADR[DT$drugs == drugA], DT$sADR[DT$drugs == drugB])))
+            
+            ## use jaccard index to create a categorization of serious ADR 
+            VA = 1*sADR %in% unique(DT$ADR_meddra[DT$drugs == drugA]) 
+            VB = 1*sADR %in% unique(DT$ADR_meddra[DT$drugs == drugB])
+            seA = sum(VA); seB = sum(VB) # number of serious side-effects 
+            sADR_jaccard <- jaccard::jaccard(VA, VB)
+            
+            cbind.data.frame(drugA = drugA, drugB = drugB, 
+                             no.durgA.genes = gA, no.drugB.genes = gB, 
+                             no.drugA.ADR = eA, no.drugB.ADR = eB, 
+                             no.drugA.sADR = seA, no.drugB.sADR =seB, 
+                             sADR_jaccard = sADR_jaccard, 
+                             Gene_jaccard= Gene_jaccard, 
+                             ADR_jaccard = ADR_jaccard, 
+                             sADR = sadr, g, e)
+}
+
+
+
+
+
+
+
+
